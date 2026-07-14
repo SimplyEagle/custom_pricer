@@ -40,21 +40,17 @@ pub async fn get_price(
     let current_key_value = { *state.live_key_price_metal.read().unwrap() };
 
     // 2. Ask the Engine to calculate the raw metal value
-    let base_value_metal = match calculate_item_value(&payload.sku, Arc::clone(&state)).await {
-        Ok(val) => val,
-        Err(_) => 0.0, // Error handling
+    let (base_value_metal, source_marker) = match calculate_item_value(&payload.sku, Arc::clone(&state)).await {
+        Ok((val, src)) => (val, src),
+        Err(_) => (0.0, "error".to_string()),
     };
-
-    // 3. Apply Profit Margins (e.g., Buy at 95%, Sell at 105%)
-    let buy_value_metal = base_value_metal * 0.95;
-    let sell_value_metal = base_value_metal * 1.05;
 
     Json(build_response(
         &payload.sku, 
         buy_value_metal, 
         sell_value_metal, 
         current_key_value, 
-        "rust_custom_pricer"
+        &source_marker
     ))
 }
 

@@ -85,33 +85,30 @@ fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
 async fn run_cleanup(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     tracing::info!("🧹 [Garbage Collector] Running cleanup...");
     
-    // Step A: Calculate daily medians for data older than 30 days and save it to the rollup table
+    // Step A: Calculate daily medians SEPARATELY for buy and sell intents
     sqlx::query(
         r#"
-        INSERT INTO historical_rollups (sku, record_date, median_price, volume)
+        INSERT INTO historical_rollups (sku, intent, record_date, median_price, volume)
         SELECT 
             sku, 
+            intent, -- 👈 NEW
             DATE(created_at) as record_date, 
             percentile_cont(0.5) WITHIN GROUP (ORDER BY price_total_metal) as median_price,
             COUNT(*) as volume
         FROM historical_listings
         WHERE created_at < NOW() - INTERVAL '30 days'
-        GROUP BY sku, DATE(created_at)
-        ON CONFLICT (sku, record_date) DO NOTHING;
+        GROUP BY sku, intent, DATE(created_at) -- 👈 NEW: Group by intent
+        ON CONFLICT (sku, intent, record_date) DO NOTHING;
         "#
     )
     .execute(pool)
     .await?;
     
-    // Step B: Delete the raw data we just rolled up
-    let result = sqlx::query(
-        "DELETE FROM historical_listings WHERE created_at < NOW() - INTERVAL '30 days'"
-    )
-    .execute(pool)
-    .await?;
+    let result = sqlx::query("DELETE FROM historical_listings WHERE created_at < NOW() - INTERVAL '30 days'")
+        .execute(pool)
+        .await?;
         
     tracing::info!("♻️ [Garbage Collector] Success. Cleared {} raw rows.", result.rows_affected());
-    
     Ok(())
 }
 

@@ -1,87 +1,99 @@
 use sqlx::{PgPool, Row};
+use tracing::{debug, warn};
 
-/// Fetches the rolling median price, blending recent and historical data,
-/// and applies Shock Detection to react instantly to market crashes/spikes.
+pub struct MarketSpread {
+    pub buy_metal: f32,
+    pub sell_metal: f32,
+}
+
 pub async fn get_adaptive_median(
     sku: &str,
     lookback_days: i32,
     min_volume: i64,
     pool: &PgPool,
-) -> Option<f32> {
+) -> Option<MarketSpread> {
     
-    // The "Stitching" Query with Timeframe Filters
     let query = r#"
         SELECT 
-            -- 1. The Immediate Trend (Last 24h)
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE age_days <= 1) as median_24h,
-            -- 2. The Standard Baseline (Last 7d)
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE age_days <= 7) as median_7d,
-            -- 3. The Long-Term Context (Requested Lookback)
-            percentile_cont(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE age_days <= $2::int) as median_long,
+            -- BUY Medians
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE age_days <= 1 AND intent = 'buy') as buy_24h,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE age_days <= 7 AND intent = 'buy') as buy_7d,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE age_days <= $2::int AND intent = 'buy') as buy_long,
+            
+            -- SELL Medians
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE age_days <= 1 AND intent = 'sell') as sell_24h,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE age_days <= 7 AND intent = 'sell') as sell_7d,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY price) FILTER (WHERE age_days <= $2::int AND intent = 'sell') as sell_long,
             
             SUM(volume) as total_volume
         FROM (
-            SELECT price_total_metal as price, 1 as volume, EXTRACT(EPOCH FROM (NOW() - created_at))/86400 as age_days 
+            SELECT price_total_metal as price, intent, 1 as volume, EXTRACT(EPOCH FROM (NOW() - created_at))/86400 as age_days 
             FROM historical_listings 
             WHERE sku = $1 AND created_at >= NOW() - ($2::int * INTERVAL '1 day')
             
             UNION ALL
             
-            SELECT median_price as price, volume, EXTRACT(EPOCH FROM (NOW() - record_date))/86400 as age_days 
+            SELECT median_price as price, intent, volume, EXTRACT(EPOCH FROM (NOW() - record_date))/86400 as age_days 
             FROM historical_rollups 
             WHERE sku = $1 AND record_date >= NOW() - ($2::int * INTERVAL '1 day')
         ) combined_data;
     "#;
 
-    if let Ok(row) = sqlx::query(query)
-        .bind(sku)
-        .bind(lookback_days)
-        .fetch_one(pool)
-        .await 
-    {
+    if let Ok(row) = sqlx::query(query).bind(sku).bind(lookback_days).fetch_one(pool).await {
         let volume: i64 = row.try_get("total_volume").unwrap_or(0);
         
         if volume >= min_volume {
-            // Extract the medians. If recent data is missing (e.g., rare unusuals), it gracefully inherits older baselines.
-            let m_long: f64 = row.try_get("median_long").unwrap_or(0.0);
-            let m_7d: f64 = row.try_get("median_7d").unwrap_or(m_long);
-            let m_24h: f64 = row.try_get("median_24h").unwrap_or(m_7d);
+            let b_long: f64 = row.try_get("buy_long").unwrap_or(0.0);
+            let b_7d: f64 = row.try_get("buy_7d").unwrap_or(b_long);
+            let b_24h: f64 = row.try_get("buy_24h").unwrap_or(b_7d);
 
-            if m_long == 0.0 { return None; } // Complete lack of data failsafe
+            let s_long: f64 = row.try_get("sell_long").unwrap_or(0.0);
+            let s_7d: f64 = row.try_get("sell_7d").unwrap_or(s_long);
+            let s_24h: f64 = row.try_get("sell_24h").unwrap_or(s_7d);
+
+            // Failsafe: Needs at least one valid dataset
+            if b_long == 0.0 && s_long == 0.0 { return None; }
 
             // --- SHOCK DETECTION MATH ENGINE ---
-            let shock_threshold = if sku == "5021;6" {
-                0.04 // 4% threshold strictly for Keys
-            } else {
-                0.15 // 15% threshold for standard weapons and cosmetics
+            let shock_threshold = match sku {
+                "5021;6" => 0.04, 
+                "725;6" | "728;6" => 0.05, 
+                _ => 0.15,
             };
 
-            // Calculate the actual market shift between recent (24h) and baseline (7d)
-            let shift_percentage = if m_7d > 0.0 {
-                (m_24h - m_7d).abs() / m_7d
+            let mid_7d = (b_7d + s_7d) / 2.0;
+            let mid_24h = (b_24h + s_24h) / 2.0;
+
+            let shift_percentage = if mid_7d > 0.0 {
+                (mid_24h - mid_7d).abs() / mid_7d
+            } else { 0.0 };
+
+            let (weight_recent, weight_hist) = if shift_percentage > shock_threshold {
+                warn!("🚨 [SHOCK DETECTED] {} shifted {:.2}%. Engaging Reactive Weighting.", sku, shift_percentage * 100.0);
+                (0.90, 0.10)
             } else {
-                0.0
+                (0.30, 0.70)
             };
 
-            let final_price = if shift_percentage > shock_threshold {
-                tracing::warn!("🚨 [SHOCK DETECTED] {} moved by {:.2}%. Switching to Reactive Weighting.", sku, shift_percentage * 100.0);
-                // Reactive: 90% Recent Data, 10% Historical Data
-                (m_24h * 0.90) + (m_7d * 0.10)
-            } else {
-                // Stable: 30% Recent Data, 70% Historical Data
-                (m_24h * 0.30) + (m_7d * 0.70)
-            };
+            let mut final_buy = (b_24h * weight_recent) + (b_7d * weight_hist);
+            let mut final_sell = (s_24h * weight_recent) + (s_7d * weight_hist);
 
-            return Some(final_price as f32);
-        } else {
-            tracing::debug!("⚠️ [DB] Insufficient volume for {}. Found: {}/{}", sku, volume, min_volume);
+            // Safety Net: Prevent crossed spreads (buying higher than selling)
+            if final_buy >= final_sell {
+                let mid = (final_buy + final_sell) / 2.0;
+                final_buy = mid * 0.98; // Force a 2% spread minimum
+                final_sell = mid * 1.02;
+            }
+
+            return Some(MarketSpread {
+                buy_metal: final_buy as f32,
+                sell_metal: final_sell as f32,
+            });
         }
     }
-
     None 
 }
 
-/// Helper function to quickly pull the key baseline
-pub async fn get_24h_key_median(pool: &PgPool) -> Option<f32> {
+pub async fn get_24h_key_median(pool: &PgPool) -> Option<MarketSpread> {
     get_adaptive_median("5021;6", 7, 50, pool).await
 }
