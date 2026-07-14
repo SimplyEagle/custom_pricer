@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: tf2_market_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: tf2_market
+    ports:
+      - "5432:5432"
+    volumes:
+      # Persists your historical market data across container restarts
+      - postgres_data:/var/lib/postgresql/data
+      # Automatically runs the table creation script on first boot
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  pricer:
+    container_name: custom_pricer
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # Connects the Rust app to the 'db' container using the internal Docker network
+      - DATABASE_URL=postgres://postgres:password@db:5432/tf2_market
+      # Sets the logging level for the Rust application - info is a good default for production, but you can change it to debug for more verbose output
+      - RUST_LOG=info
+    depends_on:
+      - db
+
+volumes:
+  postgres_data:
