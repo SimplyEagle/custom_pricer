@@ -32,6 +32,7 @@ fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
         let mut sheen = None;
         let mut killstreaker = None;
         let mut ks_tier = None;
+        let mut strange_parts = Vec::new();
         
         let mut is_australium = false;
         let mut is_festivized = false;
