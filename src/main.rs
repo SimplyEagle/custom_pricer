@@ -81,6 +81,40 @@ fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
     Some(sku)
 }
 
+/// Helper function to perform the data rollup and deletion
+async fn run_cleanup(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    tracing::info!("🧹 [Garbage Collector] Running cleanup...");
+    
+    // Step A: Calculate daily medians for data older than 30 days and save it to the rollup table
+    sqlx::query(
+        r#"
+        INSERT INTO historical_rollups (sku, record_date, median_price, volume)
+        SELECT 
+            sku, 
+            DATE(created_at) as record_date, 
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY price_total_metal) as median_price,
+            COUNT(*) as volume
+        FROM historical_listings
+        WHERE created_at < NOW() - INTERVAL '30 days'
+        GROUP BY sku, DATE(created_at)
+        ON CONFLICT (sku, record_date) DO NOTHING;
+        "#
+    )
+    .execute(pool)
+    .await?;
+    
+    // Step B: Delete the raw data we just rolled up
+    let result = sqlx::query(
+        "DELETE FROM historical_listings WHERE created_at < NOW() - INTERVAL '30 days'"
+    )
+    .execute(pool)
+    .await?;
+        
+    tracing::info!("♻️ [Garbage Collector] Success. Cleared {} raw rows.", result.rows_affected());
+    
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     // 0. Explicitly declare the cryptography backend
@@ -186,7 +220,7 @@ async fn main() {
         
         // This runs immediately when the bot starts to clear anything missed while down
         let _ = run_cleanup(&gc_pool).await;
-        
+
         // Loop forever
         loop {
             // Wake up every 24 hours
