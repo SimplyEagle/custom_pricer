@@ -184,6 +184,9 @@ async fn main() {
     tokio::spawn(async move {
         info!("🧹 [Garbage Collector] Downsampling worker initialized.");
         
+        // This runs immediately when the bot starts to clear anything missed while down
+        let _ = run_cleanup(&gc_pool).await;
+        
         // Loop forever
         loop {
             // Wake up every 24 hours
