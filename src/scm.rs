@@ -1,6 +1,8 @@
 use reqwest::Client;
 use serde_json::Value;
 use tracing::{info, warn};
+extern crate urlencoding;
+use urlencoding::encode;
 
 /// Fetches the fiat price of an item from the SCM and converts it to Refined Metal
 pub async fn fetch_fallback_price(sku: &str, live_key_metal_price: f32) -> Option<f32> {

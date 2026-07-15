@@ -16,3 +16,4 @@ tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-native-roots"]
 rustls = { version = "0.23", features = ["ring"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+urlencoding = "2.1.3"
