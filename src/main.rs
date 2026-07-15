@@ -7,6 +7,7 @@ mod api;
 mod websocket;
 mod traits;
 mod models;
+mod scm;
 
 use axum::{routing::post, Router};
 use std::net::SocketAddr;
@@ -67,8 +68,8 @@ fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
                 2025 => ks_tier = value,     // Killstreak Tier (1 = KS, 2 = Spec, 3 = Pro)
                 2053 => is_festivized_attr = true, // Fallback catch for Festivized
                 214 if value == Some(11) => is_strange_elevated = true, // Elevated Strange Quality
-                id if crate::traits::get_strange_part_defindex(id as i32).is_some() => {
-                    if let Some(part_defindex) = crate::traits::get_strange_part_defindex(id as i32) {
+                id if crate::traits::get_strange_part_defindex(id).is_some() => {
+                    if let Some(part_defindex) = crate::traits::get_strange_part_defindex(id) {
                         strange_parts.push(part_defindex);
                     }
                 },
