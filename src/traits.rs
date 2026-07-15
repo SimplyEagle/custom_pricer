@@ -13,6 +13,19 @@ pub enum Sheen {
     Unknown,
 }
 
+/// TF2 Killstreaker IDs
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Killstreaker {
+    FireHorns = 2002,
+    CerebralDischarge = 2003,
+    Tornado = 2004,
+    Flames = 2005,
+    Singularity = 2006,
+    Incinerator = 2007,
+    HypnoBeam = 2008,
+    Unknown,
+}
+
 impl Sheen {
     pub fn from_id(id: i32) -> Self {
         match id {
@@ -36,19 +49,6 @@ impl Sheen {
             Sheen::MeanGreen | Sheen::Unknown => 0.85, // Heavily penalized
         }
     }
-}
-
-/// TF2 Killstreaker IDs
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Killstreaker {
-    FireHorns = 2002,
-    CerebralDischarge = 2003,
-    Tornado = 2004,
-    Flames = 2005,
-    Singularity = 2006,
-    Incinerator = 2007,
-    HypnoBeam = 2008,
-    Unknown,
 }
 
 impl Killstreaker {
@@ -103,6 +103,14 @@ pub fn calculate_pro_ks_premium(sku: &str, generic_kit_metal_value: f32) -> f32 
     
     // The final premium is the baseline kit value scaled by the desirability of the combo
     generic_kit_metal_value * sheen_mult * streaker_mult
+}
+
+/// Helper to determine if a hat scales additively or multiplicatively with Unusual effects
+pub fn is_cancer_hat(base_sku: &str) -> bool {
+    // A placeholder list of undesirable defindexes (e.g., Brain Bucket, Dread Knot)
+    let cancer_defindexes = ["116", "233"]; 
+    let base_defindex = base_sku.split(';').next().unwrap_or("");
+    cancer_defindexes.contains(&base_defindex)
 }
 
 /// Calculates the Unusual premium based on the historical median of the Effect ID itself
@@ -193,16 +201,7 @@ pub fn get_strange_part_defindex(attribute_id: i64) -> Option<i64> {
 
 /// Calculates the final market price of a strange weapon by adding 20% 
 /// of the unapplied value of each attached Strange Part.
-pub fn calculate_strange_parts_premium(
-    base_weapon_metal_value: f32, 
-    strange_parts_metal_values: Vec<f32>
-) -> f32 {
-    let mut total_premium = 0.0;
-    
-    for part_value in strange_parts_metal_values {
-        // Industry standard: Applied parts retain 20% of their base value
-        total_premium += part_value * 0.20; 
-    }
-
-    base_weapon_metal_value + total_premium
+/// Applies the industry-standard 20% extraction rule for a single applied Strange Part
+pub fn calculate_strange_parts_premium(part_metal_value: f32) -> f32 {
+    part_metal_value * 0.20 
 }

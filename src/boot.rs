@@ -18,9 +18,14 @@ pub async fn initialize_key_price(db_pool: &PgPool) -> f32 {
 
     // Tier 1: Local Rolling Median
     println!("📊 Tier 1: Calculating rolling median from local database...");
-    if let Some(median_price) = db::get_24h_key_median(db_pool).await {
-        println!("✅ Tier 1 Success: Loaded local median key price: {} ref", median_price);
-        return median_price;
+    
+    // Use the updated get_adaptive_median function for Keys (5021;6)
+    if let Some(spread) = db::get_adaptive_median("5021;6", 7, 50, db_pool).await {
+        // Calculate the exact midpoint of the market spread to act as the global Key Value
+        let key_midpoint = (spread.buy_metal + spread.sell_metal) / 2.0; 
+        
+        println!("✅ Tier 1 Success: Loaded local median key price: {:.2} ref", key_midpoint);
+        return key_midpoint;
     }
     println!("⚠️ Tier 1 Failed: Insufficient local data for a reliable median.");
 
