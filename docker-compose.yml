@@ -30,4 +30,5 @@ services:
       - db
 
 volumes:
+  - ../tf2-trading/
   postgres_data:

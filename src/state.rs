@@ -1,24 +1,21 @@
-use sqlx::PgPool;
+use sqlx::postgres::PgPool;
 use std::sync::RwLock;
+use crate::schema::SchemaMap;
 
-/// Shared application state accessible by all Axum routes
 pub struct AppState {
-    /// Database connection pool
     pub db_pool: PgPool,
-    
-    /// Thread-safe live key price in Refined metal
     pub live_key_price_metal: RwLock<f32>,
-    
-    /// If true, the bot will return 0 confidence to prevent trading
     pub is_lockdown: RwLock<bool>,
+    pub schema: SchemaMap,
 }
 
 impl AppState {
-    pub fn new(db_pool: PgPool, initial_key_price: f32) -> Self {
+    pub fn new(db_pool: PgPool, initial_key_price: f32, schema: SchemaMap) -> Self {
         Self {
             db_pool,
             live_key_price_metal: RwLock::new(initial_key_price),
             is_lockdown: RwLock::new(false),
+            schema,
         }
     }
 }

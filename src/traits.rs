@@ -199,11 +199,21 @@ pub fn get_strange_part_defindex(attribute_id: i64) -> Option<i64> {
     }
 }
 
-/// Identifies heavily discounted cosmetic hats to prevent overpayment on low-tier Unusuals.
+/// Checks if a cosmetic item is notoriously low-demand, applying penalties
 pub fn is_cancer_hat(sku: &str) -> bool {
-    let cancer_defindexes = vec!["311", "343", "415", "506"]; // Dread Knot, Brain Bucket, etc.
-    let base_defindex = sku.split(';').next().unwrap_or("");
-    cancer_defindexes.contains(&base_defindex)
+    let cancer_defindexes = [
+        "133", // Texas Ten Gallon
+        "214", // Ellis' Cap
+        "233", // Grenadier's Softcap
+        "31114", // Bot Dogger
+    ]; 
+
+    for def in cancer_defindexes.iter() {
+        if sku.starts_with(&format!("{};", def)) { 
+            return true; 
+        }
+    }
+    false
 }
 
 /// Calculates the final market price of a strange weapon by adding 20% 

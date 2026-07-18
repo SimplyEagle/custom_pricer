@@ -1,59 +1,93 @@
-use reqwest::Client;
-use serde_json::Value;
-use tracing::{info, warn};
-extern crate urlencoding;
-use urlencoding::encode;
+use serde::Deserialize;
+use tracing::{debug, error, info};
+use crate::schema::SchemaMap;
 
-/// Fetches the fiat price of an item from the SCM and converts it to Refined Metal
-pub async fn fetch_fallback_price(sku: &str, live_key_metal_price: f32) -> Option<f32> {
-    
-    // 1. Translate SKU to Market Hash Name
-    let market_hash_name = match sku {
-        "5021;6" => "Mann Co. Supply Crate Key",
-        "725;6" => "Tour of Duty Ticket",
-        "728;6" => "Squad Surplus Voucher",
-        _ => {
-            warn!("⚠️ [SCM] Name resolution for SKU {} not implemented yet.", sku);
-            return None; 
-        }
-    };
-
-    let client = Client::new();
-    
-    // 2. Fetch the baseline Key Fiat Price ($)
-    let key_fiat = fetch_fiat_price("Mann Co. Supply Crate Key", &client).await?;
-    
-    // 3. Fetch the target Item Fiat Price ($)
-    let item_fiat = fetch_fiat_price(market_hash_name, &client).await?;
-
-    // 4. Execute Fiat-to-Metal Conversion Math
-    let value_in_keys = item_fiat / key_fiat;
-    let final_metal_value = value_in_keys * live_key_metal_price;
-
-    info!("🚂 [SCM] Converted ${:.2} fiat to {:.2} ref for {}", item_fiat, final_metal_value, sku);
-    
-    Some(final_metal_value)
+#[derive(Deserialize, Debug)]
+struct ScmResponse {
+    success: bool,
+    lowest_price: Option<String>,
 }
 
-/// Helper function to hit the official Steam API and parse the lowest listing
-async fn fetch_fiat_price(market_hash_name: &str, client: &Client) -> Option<f32> {
+/// Fetches the fiat value (in USD) of an item from the Steam Community Market
+async fn fetch_scm_item_fiat_value(market_hash_name: &str) -> Result<f32, Box<dyn std::error::Error>> {
     let url = format!(
         "https://steamcommunity.com/market/priceoverview/?appid=440&currency=1&market_hash_name={}",
         urlencoding::encode(market_hash_name)
     );
 
-    let res = client.get(&url).send().await.ok()?;
-    let text = res.text().await.ok()?;
-    let json: Value = serde_json::from_str(&text).ok()?;
+    let client = reqwest::Client::new();
+    let response = client.get(&url).send().await?;
 
-    if json["success"].as_bool() == Some(true) {
-        if let Some(lowest_price) = json["lowest_price"].as_str() {
-            // SCM returns strings like "$2.35" or "1,200.50". We must strip the symbols to parse the float.
-            let clean_price = lowest_price.replace('$', "").replace(',', "");
-            return clean_price.parse::<f32>().ok();
+    if !response.status().is_success() {
+        return Err(format!("SCM API returned HTTP status {}", response.status()).into());
+    }
+
+    let text = response.text().await?;
+    let data: ScmResponse = serde_json::from_str(&text)?;
+
+    if !data.success {
+        return Err("SCM returned success: false".into());
+    }
+
+    if let Some(price_str) = data.lowest_price {
+        // Price comes in as a string like "$2.50" or "2,50€". 
+        // We strip symbols and commas to isolate the float value.
+        let clean_price: String = price_str.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
+        if let Ok(val) = clean_price.parse::<f32>() {
+            return Ok(val);
         }
     }
-    
-    warn!("⚠️ [SCM] Failed to find market data for {}", market_hash_name);
-    None
+
+    Err("No valid lowest_price found in SCM response".into())
+}
+
+/// The Ultimate Safety Net: Translate SKU, fetch SCM fiat, convert to metal spread
+pub async fn fetch_fallback_price(sku: &str, live_key_price_metal: f32, schema: &SchemaMap) -> Option<f32> {
+    // 1. Hardcoded bypass for Keys to prevent unnecessary SCM spam loops
+    if sku == "5021;6" {
+        debug!("🔑 [SCM] SKU is Key, bypassing SCM Fallback.");
+        return None;
+    }
+
+    // 2. Translate numerical SKU into English SCM name
+    let market_hash_name = match schema.sku_to_scm_name(sku) {
+        Some(name) => name,
+        None => {
+            error!("❌ [SCM] Failed to translate SKU {} to English. Missing from schema?", sku);
+            return None;
+        }
+    };
+
+    info!("🌐 [SCM] Requesting Steam Market price for: {}", market_hash_name);
+
+    // 3. Fetch Fiat Value for the target item
+    let item_fiat_value = match fetch_scm_item_fiat_value(&market_hash_name).await {
+        Ok(val) => val,
+        Err(e) => {
+            error!("❌ [SCM] Failed to fetch item price from Steam: {}", e);
+            return None;
+        }
+    };
+
+    // 4. Fetch Fiat Value for a Key to establish the conversion ratio
+    let key_fiat_value = match fetch_scm_item_fiat_value("Mann Co. Supply Crate Key").await {
+        Ok(val) => val,
+        Err(e) => {
+            error!("❌ [SCM] Failed to fetch Key price for fiat conversion: {}", e);
+            return None;
+        }
+    };
+
+    if key_fiat_value <= 0.0 {
+        return None;
+    }
+
+    // 5. Fiat-to-Metal Conversion Math
+    let item_value_in_keys = item_fiat_value / key_fiat_value;
+    let item_value_in_metal = item_value_in_keys * live_key_price_metal;
+
+    info!("✅ [SCM] Fallback Success: {} is worth ${:.2} (Key is ${:.2}). Calculated Base Metal: {:.2} ref",
+        market_hash_name, item_fiat_value, key_fiat_value, item_value_in_metal);
+
+    Some(item_value_in_metal)
 }

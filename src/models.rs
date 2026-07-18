@@ -1,27 +1,38 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-/// Represents the top-level websocket message from backpack.tf
+// --------------------------------------------------------
+// INCOMING: Backpack.tf Websocket Payload
+// --------------------------------------------------------
 #[derive(Deserialize, Debug)]
 pub struct WsMessage {
-    pub event: String,
-    pub payload: Option<ListingPayload>,
+    pub id: Option<String>,
+    pub event: Option<String>,
+    pub payload: serde_json::Value, // Uses serde_json::Value to prevent array/struct crashes on error messages
 }
 
-/// The inner payload detailing the specific item and price
+// --------------------------------------------------------
+// INCOMING: API Route Request from tf2autobot
+// --------------------------------------------------------
 #[derive(Deserialize, Debug)]
-pub struct ListingPayload {
-    pub item: Item,
-    pub intent: String, // "buy" or "sell"
-    pub currencies: Currencies,
+pub struct PricerRequest {
+    pub sku: String,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Item {
-    pub sku: Option<String>,
+// --------------------------------------------------------
+// OUTGOING: API Route Response to tf2autobot
+// --------------------------------------------------------
+#[derive(Serialize, Debug)]
+pub struct PricerResponse {
+    pub sku: String,
+    pub name: Option<String>,
+    pub buy: Currency,
+    pub sell: Currency,
+    pub source: String,
+    pub time: i64,
 }
 
-#[derive(Deserialize, Debug, Default)]
-pub struct Currencies {
-    pub keys: Option<i32>,
-    pub metal: Option<f32>,
+#[derive(Serialize, Debug)]
+pub struct Currency {
+    pub keys: i32,
+    pub metal: f32,
 }

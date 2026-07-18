@@ -8,7 +8,8 @@ mod websocket;
 mod traits;
 mod models;
 mod scm;
-
+mod schema;
+    
 use axum::{routing::post, Router};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,52 +18,52 @@ use sqlx::postgres::PgPoolOptions;
 use tracing::{info, debug, warn, error};
 use state::AppState;
 
-/// Constructs a perfectly formatted SKU string from a raw backpack.tf JSON item
 fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
     let defindex = item["defindex"].as_i64()?;
     
-    // Ignore invalid items
     if defindex <= 0 { return None; }
     
-    // Backpack.tf can send quality as an int or an object depending on the event
     let quality = item["quality"].as_i64()
         .or_else(|| item["quality"]["id"].as_i64())
         .unwrap_or(6);
+        
+    let mut sku = format!("{};{}", defindex, quality);
 
-    // Prepare trait booleans (Backpack.tf mixes root-level booleans and attribute arrays)
-    let mut is_craftable = item["craftable"].as_bool().unwrap_or(true);
-    let mut is_australium = item["australium"].as_bool().unwrap_or(false);
-    let mut is_festivized = item["festivized"].as_bool().unwrap_or(false);
-    
+    // --- 1. TF2-SKU STANDARD ORDER ---
+    let is_craftable = item["craftable"].as_bool().unwrap_or(true);
+    if !is_craftable {
+        sku.push_str(";uncraftable");
+    }
+
+    // Explicitly catch top-level booleans sent by backpack.tf
+    let is_australium = item["australium"].as_bool().unwrap_or(false);
+    if is_australium {
+        sku.push_str(";australium");
+    }
+
+    let is_festivized = item["festivized"].as_bool().unwrap_or(false);
+
     let mut effect = None;
     let mut sheen = None;
     let mut killstreaker = None;
     let mut ks_tier = None;
     let mut strange_parts = Vec::new();
-    let mut paintkit = None;
-    let mut wear = None;
     let mut is_strange_elevated = false;
+    let mut is_festivized_attr = false;
 
-    // Parse traits from the attributes array FIRST
     if let Some(attributes) = item["attributes"].as_array() {
         for attr in attributes {
             let attr_def = attr["defindex"].as_i64().unwrap_or(0);
-            
-            // Backpack.tf stores values either as an int or a float depending on the attribute
             let value = attr["value"].as_i64().or_else(|| attr["float_value"].as_f64().map(|v| v as i64));
 
             match attr_def {
-                134 => effect = value,       // Unusual Effect ID
-                834 => paintkit = value,     // Warpaint/Paintkit ID
-                725 => wear = value,         // Wear/Condition ID
-                2013 => sheen = value,       // Killstreak Sheen ID
-                2014 => killstreaker = value,// Professional Killstreaker ID
-                2025 => ks_tier = value,     // Killstreak Tier (1 = KS, 2 = Spec, 3 = Pro)
-                2027 => is_australium = true, // Australium Weapon (Attribute fallback)
-                2053 => is_festivized = true, // Festivized Weapon (Attribute fallback)
-                214 if value == Some(11) => is_strange_elevated = true, // Elevated Strange Quality
-                
-                // Catch Strange Parts dynamically using our Matrix
+                134 => effect = value,
+                2013 => sheen = value,
+                2014 => killstreaker = value,
+                2025 => ks_tier = value,
+                2027 => {}, // Already caught via root boolean
+                2053 => is_festivized_attr = true,
+                214 if value == Some(11) => is_strange_elevated = true,
                 id if crate::traits::get_strange_part_defindex(id).is_some() => {
                     if let Some(part_defindex) = crate::traits::get_strange_part_defindex(id) {
                         strange_parts.push(part_defindex);
@@ -73,51 +74,23 @@ fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
         }
     }
 
-    // Now build the SKU in the EXACT tf2-sku standard order
-    let mut sku = format!("{};{}", defindex, quality);
-
-    // 1. Uncraftable
-    if !is_craftable {
-        sku.push_str(";uncraftable");
-    }
-
-    // 2. Australium
-    if is_australium {
-        sku.push_str(";australium");
-    }
-
-    // 3. Festive (Festivized)
-    if is_festivized {
+    if is_festivized || is_festivized_attr {
         sku.push_str(";festive");
     }
 
-    // 4. Elevated Strange
     if is_strange_elevated {
         sku.push_str(";strange");
     }
 
-    // 5. Unusual Effect
     if let Some(e) = effect {
         sku.push_str(&format!(";u{}", e));
     }
 
-    // 6. Warpaint Paintkit
-    if let Some(pk) = paintkit {
-        sku.push_str(&format!(";pk{}", pk));
-    }
-
-    // 7. Warpaint Wear
-    if let Some(w) = wear {
-        sku.push_str(&format!(";w{}", w));
-    }
-
-    // 8. Killstreak Tier
     if let Some(kt) = ks_tier {
         sku.push_str(&format!(";kt-{}", kt));
     }
 
-    // --- CUSTOM PRICER TRAITS ---
-    // These go at the very end so they don't disrupt base TF2Autobot parsing
+    // --- 2. CUSTOM PRICER TRAITS ---
     if let Some(sh) = sheen {
         sku.push_str(&format!(";sheen-{}", sh));
     }
@@ -125,7 +98,6 @@ fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
         sku.push_str(&format!(";streaker-{}", st));
     }
     
-    // Sort strange parts so the string is always consistent
     strange_parts.sort_unstable();
     for part_defindex in strange_parts {
         sku.push_str(&format!(";sp-{}", part_defindex));
@@ -134,16 +106,14 @@ fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
     Some(sku)
 }
 
-/// Helper function to perform the data rollup and deletion
 async fn run_cleanup(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     tracing::info!("🧹 [Garbage Collector] Running cleanup...");
     
-    // Step A: Calculate daily medians SEPARATELY for buy and sell intents
     sqlx::query(
         r#"
         INSERT INTO historical_rollups (sku, intent, record_date, median_price, volume)
-        SELECT
-            sku,
+        SELECT 
+            sku, 
             intent,
             DATE(created_at) as record_date,
             percentile_cont(0.5) WITHIN GROUP (ORDER BY price_total_metal) as median_price,
@@ -167,18 +137,15 @@ async fn run_cleanup(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
 
 #[tokio::main]
 async fn main() {
-    // 0. Explicitly declare the cryptography backend to resolve rustls conflict
     rustls::crypto::ring::default_provider().install_default()
         .expect("Failed to install rustls crypto provider");
 
-    // Initialize the tracing subscriber to read the RUST_LOG environment variable
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     info!("🔧 Booting Rust TF2 Pricer...");
 
-    // 1. Initialize Database
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/tf2_market".to_string());
         
@@ -186,24 +153,23 @@ async fn main() {
         .max_connections(5)
         .connect_lazy(&database_url).expect("Failed to create pool");
 
-    // 2. Run the 4-Tier Boot Sequence
     let initial_key_price = boot::initialize_key_price(&db_pool).await;
 
-    // 3. Initialize Shared Application State
-    let shared_state = Arc::new(AppState::new(db_pool.clone(), initial_key_price));
+    // Load Schema for SCM translations via environment variable or default
+    let schema_path = std::env::var("SCHEMA_PATH").unwrap_or_else(|_| "schema.json".to_string());
+    let schema_map = schema::SchemaMap::load(&schema_path);
+
+    let shared_state = Arc::new(AppState::new(db_pool.clone(), initial_key_price, schema_map));
 
     if initial_key_price == 60.00 {
         let mut lockdown = shared_state.is_lockdown.write().unwrap();
         *lockdown = true;
     }
 
-    // 4. Setup internal channel for Websocket -> DB ingestion
     let (tx, mut rx) = mpsc::channel::<String>(10000);
 
-    // 5. Spawn the Websocket Listener
     tokio::spawn(websocket::start_listener(tx));
     
-    // 6. Spawn the DB Ingestion worker
     let worker_pool = db_pool.clone();
     let worker_state = Arc::clone(&shared_state);
     
@@ -253,30 +219,23 @@ async fn main() {
                         warn!("🚨 [API LIMIT] Backpack.tf rejected the connection. Check for ghost connections!");
                     }
                 }
-            } else {
-                debug!("⚠️ [Worker] Failed to parse message block.");
             }
         }
     });
 
-    // 7. Spawn the Data Rollup & Cleanup Worker (The Garbage Collector)
     let gc_pool = db_pool.clone();
     tokio::spawn(async move {
         info!("🧹 [Garbage Collector] Downsampling worker initialized.");
         
-        // This runs immediately when the bot starts to clear anything missed while down
         let _ = run_cleanup(&gc_pool).await;
 
-        // Loop forever
         loop {
-            // Wake up every 24 hours
             tokio::time::sleep(std::time::Duration::from_secs(60 * 60 * 24)).await;
             info!("🧹 [Garbage Collector] Waking up to compress old data...");
             let _ = run_cleanup(&gc_pool).await;
         }
     });
 
-    // 8. Start the Axum HTTP Server
     let app = Router::new()
         .route("/price", post(api::get_price))
         .with_state(shared_state);
