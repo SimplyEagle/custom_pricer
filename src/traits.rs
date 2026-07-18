@@ -105,14 +105,6 @@ pub fn calculate_pro_ks_premium(sku: &str, generic_kit_metal_value: f32) -> f32 
     generic_kit_metal_value * sheen_mult * streaker_mult
 }
 
-/// Helper to determine if a hat scales additively or multiplicatively with Unusual effects
-pub fn is_cancer_hat(base_sku: &str) -> bool {
-    // A placeholder list of undesirable defindexes (e.g., Brain Bucket, Dread Knot)
-    let cancer_defindexes = ["116", "233"]; 
-    let base_defindex = base_sku.split(';').next().unwrap_or("");
-    cancer_defindexes.contains(&base_defindex)
-}
-
 /// Calculates the Unusual premium based on the historical median of the Effect ID itself
 /// rather than relying on exact Hat+Effect combo historical data.
 pub fn calculate_unusual_premium(
