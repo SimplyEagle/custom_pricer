@@ -26,9 +26,12 @@ services:
       - DATABASE_URL=postgres://postgres:password@db:5432/tf2_market
       # Sets the logging level for the Rust application - info is a good default for production, but you can change it to debug for more verbose output
       - RUST_LOG=info
+      - SCHEMA_PATH=/app/shared/schema.json
+    volumes:
+      # 👇 ADDED THIS: Maps the physical schema file from your server into the container
+      - /home/bailey/tf2-trading/tf2autobot/files/schema.json:/app/shared/schema.json:ro
     depends_on:
       - db
 
 volumes:
-  - ../tf2-trading/
   postgres_data:
