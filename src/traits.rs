@@ -199,6 +199,13 @@ pub fn get_strange_part_defindex(attribute_id: i64) -> Option<i64> {
     }
 }
 
+/// Identifies heavily discounted cosmetic hats to prevent overpayment on low-tier Unusuals.
+pub fn is_cancer_hat(sku: &str) -> bool {
+    let cancer_defindexes = vec!["311", "343", "415", "506"]; // Dread Knot, Brain Bucket, etc.
+    let base_defindex = sku.split(';').next().unwrap_or("");
+    cancer_defindexes.contains(&base_defindex)
+}
+
 /// Calculates the final market price of a strange weapon by adding 20% 
 /// of the unapplied value of each attached Strange Part.
 /// Applies the industry-standard 20% extraction rule for a single applied Strange Part

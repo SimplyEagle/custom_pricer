@@ -17,6 +17,7 @@ use sqlx::postgres::PgPoolOptions;
 use tracing::{info, debug, warn, error};
 use state::AppState;
 
+/// Constructs a perfectly formatted SKU string from a raw backpack.tf JSON item
 fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
     let defindex = item["defindex"].as_i64()?;
     
@@ -27,47 +28,41 @@ fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
     let quality = item["quality"].as_i64()
         .or_else(|| item["quality"]["id"].as_i64())
         .unwrap_or(6);
-        
-    let mut sku = format!("{};{}", defindex, quality);
 
-    // --- 1. TF2-SKU STANDARD ORDER ---
+    // Prepare trait booleans (Backpack.tf mixes root-level booleans and attribute arrays)
+    let mut is_craftable = item["craftable"].as_bool().unwrap_or(true);
+    let mut is_australium = item["australium"].as_bool().unwrap_or(false);
+    let mut is_festivized = item["festivized"].as_bool().unwrap_or(false);
     
-    // Check Uncraftable
-    let is_craftable = item["craftable"].as_bool().unwrap_or(true);
-    if !is_craftable {
-        sku.push_str(";uncraftable");
-    }
-
-    // Check Australium (Root level boolean in backpack.tf firehose!)
-    let is_australium = item["australium"].as_bool().unwrap_or(false);
-    if is_australium {
-        sku.push_str(";australium");
-    }
-
-    // Check Festivized (Root level boolean)
-    let is_festivized = item["festivized"].as_bool().unwrap_or(false);
-
     let mut effect = None;
     let mut sheen = None;
     let mut killstreaker = None;
     let mut ks_tier = None;
     let mut strange_parts = Vec::new();
+    let mut paintkit = None;
+    let mut wear = None;
     let mut is_strange_elevated = false;
-    let mut is_festivized_attr = false;
 
-    // Parse traits from the attributes array
+    // Parse traits from the attributes array FIRST
     if let Some(attributes) = item["attributes"].as_array() {
         for attr in attributes {
             let attr_def = attr["defindex"].as_i64().unwrap_or(0);
+            
+            // Backpack.tf stores values either as an int or a float depending on the attribute
             let value = attr["value"].as_i64().or_else(|| attr["float_value"].as_f64().map(|v| v as i64));
 
             match attr_def {
                 134 => effect = value,       // Unusual Effect ID
+                834 => paintkit = value,     // Warpaint/Paintkit ID
+                725 => wear = value,         // Wear/Condition ID
                 2013 => sheen = value,       // Killstreak Sheen ID
                 2014 => killstreaker = value,// Professional Killstreaker ID
                 2025 => ks_tier = value,     // Killstreak Tier (1 = KS, 2 = Spec, 3 = Pro)
-                2053 => is_festivized_attr = true, // Fallback catch for Festivized
+                2027 => is_australium = true, // Australium Weapon (Attribute fallback)
+                2053 => is_festivized = true, // Festivized Weapon (Attribute fallback)
                 214 if value == Some(11) => is_strange_elevated = true, // Elevated Strange Quality
+                
+                // Catch Strange Parts dynamically using our Matrix
                 id if crate::traits::get_strange_part_defindex(id).is_some() => {
                     if let Some(part_defindex) = crate::traits::get_strange_part_defindex(id) {
                         strange_parts.push(part_defindex);
@@ -78,29 +73,51 @@ fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
         }
     }
 
-    // Append Festivized
-    if is_festivized || is_festivized_attr {
+    // Now build the SKU in the EXACT tf2-sku standard order
+    let mut sku = format!("{};{}", defindex, quality);
+
+    // 1. Uncraftable
+    if !is_craftable {
+        sku.push_str(";uncraftable");
+    }
+
+    // 2. Australium
+    if is_australium {
+        sku.push_str(";australium");
+    }
+
+    // 3. Festive (Festivized)
+    if is_festivized {
         sku.push_str(";festive");
     }
 
-    // Append Elevated Strange
+    // 4. Elevated Strange
     if is_strange_elevated {
         sku.push_str(";strange");
     }
 
-    // Append Unusual Effect
+    // 5. Unusual Effect
     if let Some(e) = effect {
         sku.push_str(&format!(";u{}", e));
     }
 
-    // Append Killstreak Tier (Base tier required by tf2autobot)
+    // 6. Warpaint Paintkit
+    if let Some(pk) = paintkit {
+        sku.push_str(&format!(";pk{}", pk));
+    }
+
+    // 7. Warpaint Wear
+    if let Some(w) = wear {
+        sku.push_str(&format!(";w{}", w));
+    }
+
+    // 8. Killstreak Tier
     if let Some(kt) = ks_tier {
         sku.push_str(&format!(";kt-{}", kt));
     }
 
-    // --- 2. CUSTOM PRICER TRAITS ---
-    // These must go at the very end so they don't disrupt the base tf2-sku matching
-
+    // --- CUSTOM PRICER TRAITS ---
+    // These go at the very end so they don't disrupt base TF2Autobot parsing
     if let Some(sh) = sheen {
         sku.push_str(&format!(";sheen-{}", sh));
     }
@@ -108,7 +125,7 @@ fn build_sku_from_item(item: &serde_json::Value) -> Option<String> {
         sku.push_str(&format!(";streaker-{}", st));
     }
     
-    // Sort strange parts so the string is always consistent regardless of the order backpack.tf sends them
+    // Sort strange parts so the string is always consistent
     strange_parts.sort_unstable();
     for part_defindex in strange_parts {
         sku.push_str(&format!(";sp-{}", part_defindex));
@@ -125,10 +142,10 @@ async fn run_cleanup(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         INSERT INTO historical_rollups (sku, intent, record_date, median_price, volume)
-        SELECT 
-            sku, 
+        SELECT
+            sku,
             intent,
-            DATE(created_at) as record_date, 
+            DATE(created_at) as record_date,
             percentile_cont(0.5) WITHIN GROUP (ORDER BY price_total_metal) as median_price,
             COUNT(*) as volume
         FROM historical_listings
@@ -150,7 +167,7 @@ async fn run_cleanup(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
 
 #[tokio::main]
 async fn main() {
-    // 0. Explicitly declare the cryptography backend
+    // 0. Explicitly declare the cryptography backend to resolve rustls conflict
     rustls::crypto::ring::default_provider().install_default()
         .expect("Failed to install rustls crypto provider");
 
@@ -162,7 +179,6 @@ async fn main() {
     info!("🔧 Booting Rust TF2 Pricer...");
 
     // 1. Initialize Database
-    // Note: When running locally use localhost. When in docker, use the env var or 'db'.
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:password@localhost/tf2_market".to_string());
         
@@ -207,18 +223,14 @@ async fn main() {
                         let metal = payload["currencies"]["metal"].as_f64().unwrap_or(0.0) as f32;
 
                         let item = &payload["item"];
-                        let defindex = item["defindex"].as_i64().unwrap_or(0);
-
-                        if defindex > 0 {
-                            let quality = item["quality"]["id"].as_i64().unwrap_or(6);
-                            let sku = format!("{};{}", defindex, quality);
-
+                        
+                        if let Some(sku) = build_sku_from_item(item) {
                             let live_key_val = { *worker_state.live_key_price_metal.read().unwrap() };
                             let total_metal = (keys as f32 * live_key_val) + metal;
 
                             let result = sqlx::query(
                                 r#"
-                                INSERT INTO historical_listings (sku, intent, keys, metal, price_total_metal) 
+                                INSERT INTO historical_listings (sku, intent, keys, metal, price_total_metal)
                                 VALUES ($1, $2, $3, $4, $5)
                                 "#
                             )
@@ -234,7 +246,6 @@ async fn main() {
                                 error!("❌ [Worker] DB Insert Error for {}: {}", sku, e);
                             } else {
                                 let name = item["baseName"].as_str().unwrap_or(&sku);
-                                // CHANGED TO DEBUG: This will only print if RUST_LOG=debug
                                 debug!("📥 [Worker] Saved {} {} ({} ref)", intent, name, total_metal);
                             }
                         }
@@ -242,6 +253,8 @@ async fn main() {
                         warn!("🚨 [API LIMIT] Backpack.tf rejected the connection. Check for ghost connections!");
                     }
                 }
+            } else {
+                debug!("⚠️ [Worker] Failed to parse message block.");
             }
         }
     });
@@ -259,40 +272,7 @@ async fn main() {
             // Wake up every 24 hours
             tokio::time::sleep(std::time::Duration::from_secs(60 * 60 * 24)).await;
             info!("🧹 [Garbage Collector] Waking up to compress old data...");
-
-            // Step A: Calculate daily medians for data older than 30 days and save it to the rollup table
-            let rollup_result = sqlx::query(
-                r#"
-                INSERT INTO historical_rollups (sku, record_date, median_price, volume)
-                SELECT 
-                    sku, 
-                    DATE(created_at) as record_date, 
-                    percentile_cont(0.5) WITHIN GROUP (ORDER BY price_total_metal) as median_price,
-                    COUNT(*) as volume
-                FROM historical_listings
-                WHERE created_at < NOW() - INTERVAL '30 days'
-                GROUP BY sku, DATE(created_at)
-                ON CONFLICT (sku, record_date) DO NOTHING;
-                "#
-            )
-            .execute(&gc_pool)
-            .await;
-
-            // Step 7B: Delete the raw data we just rolled up
-            if rollup_result.is_ok() {
-                let delete_result = sqlx::query(
-                    "DELETE FROM historical_listings WHERE created_at < NOW() - INTERVAL '30 days'"
-                )
-                .execute(&gc_pool)
-                .await;
-
-                match delete_result {
-                    Ok(result) => info!("♻️ [Garbage Collector] Success. Cleared {} raw rows.", result.rows_affected()),
-                    Err(e) => error!("❌ [Garbage Collector] Failed to delete raw data: {}", e),
-                }
-            } else {
-                error!("❌ [Garbage Collector] Failed to generate daily rollups.");
-            }
+            let _ = run_cleanup(&gc_pool).await;
         }
     });
 
