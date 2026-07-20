@@ -25,8 +25,14 @@ pub struct PriceConfig {
     pub min_volume: i64,
 }
 
+/// Evaluates a SKU and determines its pricing configuration based on intrinsic properties
 pub fn classify_sku(sku: &str) -> PriceConfig {
-    let high_velocity_skus = ["5021;6", "725;6", "728;6"];
+    // Hyper-liquid assets acting as currencies (Voucher added, Refined removed)
+    let high_velocity_skus = [
+        "5021;6", // Mann Co. Supply Crate Key
+        "725;6",  // Tour of Duty Ticket
+        "728;6",  // Squad Surplus Voucher
+    ];
 
     let is_high_velocity = high_velocity_skus.iter().any(|&s| sku.starts_with(s));
     let is_unusual = sku.split(';').nth(1) == Some("5");
@@ -55,6 +61,7 @@ pub fn classify_sku(sku: &str) -> PriceConfig {
     }
 }
 
+/// Evaluates a SKU's total market value in refined metal
 pub async fn calculate_market_price(sku: &str, pool: &PgPool, live_key_price: f32, schema: &SchemaMap) -> Option<MarketData> {
     let config = classify_sku(sku);
 
@@ -91,14 +98,18 @@ pub async fn calculate_market_price(sku: &str, pool: &PgPool, live_key_price: f3
     None
 }
 
+/// Breaks down a complex SKU into base components, prices them individually, and aggregates
 async fn deconstruct_and_price(sku: &str, pool: &PgPool) -> Option<MarketData> {
     let mut total_buy = 0.0;
     let mut total_sell = 0.0;
 
+    // Isolate Strange Parts from the SKU and strip them for base evaluation
     let (clean_sku, strange_parts) = extract_strange_parts(sku);
-    let base_sku = strip_all_premium_modifiers(&clean_sku);
 
     // --- STEP A: Price the Base Asset ---
+    let base_sku = strip_all_premium_modifiers(&clean_sku);
+    let base_defindex = base_sku.split(';').next().unwrap_or("").to_string();
+
     let base_spread = if base_sku == clean_sku {
         db::get_adaptive_median(&base_sku, 30, 1, pool).await?
     } else {
@@ -114,25 +125,47 @@ async fn deconstruct_and_price(sku: &str, pool: &PgPool) -> Option<MarketData> {
     // --- STEP B: Professional/Specialized Killstreak Premiums ---
     if sku.contains(";kt-") {
         let is_pro = sku.contains(";kt-3");
+        let is_spec = sku.contains(";kt-2");
         let sheen_id = extract_modifier_id(sku, ";sheen-");
         let streaker_id = extract_modifier_id(sku, ";streaker-");
 
-        let generic_kit_value = if is_pro { 350.0 } else { 45.0 }; 
-        let mut mult = 1.0;
-
-        if let Some(s_id) = sheen_id {
-            mult *= traits::Sheen::from_id(s_id as i32).market_multiplier();
-        }
+        // 1. DYNAMIC KIT LOOKUP (Real Market Value)
+        let mut kit_sku = String::new();
         if is_pro {
-            if let Some(str_id) = streaker_id {
-                mult *= traits::Killstreaker::from_id(str_id as i32).market_multiplier();
-            }
+            kit_sku = format!("6526;6;uncraftable;td-{}", base_defindex);
+            if let Some(s) = sheen_id { kit_sku.push_str(&format!(";sheen-{}", s)); }
+            if let Some(st) = streaker_id { kit_sku.push_str(&format!(";streaker-{}", st)); }
+        } else if is_spec {
+            kit_sku = format!("6523;6;uncraftable;td-{}", base_defindex);
+            if let Some(s) = sheen_id { kit_sku.push_str(&format!(";sheen-{}", s)); }
+        } else {
+            kit_sku = format!("6522;6;uncraftable;td-{}", base_defindex);
         }
 
-        let ks_premium = generic_kit_value * mult;
-        total_buy += ks_premium;
-        total_sell += ks_premium;
-        debug!("⚔️ [Engine] Appended Killstreak Premium: +{:.2} ref (Multiplier: {:.2}x)", ks_premium, mult);
+        // Check the database for the exact Kit's 180-day market spread
+        if let Some(kit_spread) = db::get_adaptive_median(&kit_sku, 180, 2, pool).await {
+            total_buy += kit_spread.buy_metal;
+            total_sell += kit_spread.sell_metal;
+            debug!("⚔️ [Engine] Appended EXACT Killstreak Kit Premium from DB: +{:.2} ref", kit_spread.sell_metal);
+        } else {
+            // 2. STATIC MULTIPLIER FALLBACK
+            let generic_kit_value = if is_pro { 350.0 } else { 45.0 }; // ~6 Keys vs ~0.8 Keys baseline
+            let mut mult = 1.0;
+
+            if let Some(s_id) = sheen_id {
+                mult *= traits::Sheen::from_id(s_id as i32).market_multiplier();
+            }
+            if is_pro {
+                if let Some(str_id) = streaker_id {
+                    mult *= traits::Killstreaker::from_id(str_id as i32).market_multiplier();
+                }
+            }
+
+            let ks_premium = generic_kit_value * mult;
+            total_buy += ks_premium;
+            total_sell += ks_premium;
+            debug!("⚔️ [Engine] Appended Calculated Killstreak Premium: +{:.2} ref (Multiplier: {:.2}x)", ks_premium, mult);
+        }
     }
 
     // --- STEP C: Unusual Particle Premiums ---

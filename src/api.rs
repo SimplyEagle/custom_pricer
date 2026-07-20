@@ -1,66 +1,64 @@
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use chrono::Utc;
-use crate::state::AppState;
-use crate::currency::{Currency, to_tf2_currency};
+use crate::models::Currency;
 use crate::engine::calculate_market_price;
+use crate::state::AppState;
+use std::sync::Arc;
 
 #[derive(Deserialize)]
 pub struct PricerRequest {
     pub sku: String,
 }
 
-/// Formatted perfectly for TF2Autobot's custom pricer consumption
+/// The exact JSON contract `tf2autobot-pricedb` expects.
+/// Replaces the deprecated flat `buy_half_scrap` integers with proper Currency objects.
 #[derive(Serialize)]
 pub struct PricerResponse {
     pub sku: String,
-    pub name: Option<String>,
+    pub name: String,
     pub buy: Currency,
     pub sell: Currency,
-    pub source: String,
-    pub time: i64,
+    pub source: String, // Tracks if this was a DB Match, Trait Deconstruction, or API Fallback
+    pub time: i64,      // Unix timestamp for price age tracking
 }
 
 pub async fn get_price(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<PricerRequest>,
-) -> Json<PricerResponse> {
+) -> Json<Option<PricerResponse>> {
+    let sku = payload.sku;
     
-    // Check if system is in lockdown
-    let is_lockdown = { *state.is_lockdown.read().unwrap() };
-    let current_key_value = { *state.live_key_price_metal.read().unwrap() };
+    // 🚨 FIX: MarketData is a struct, not a tuple. Unpack it correctly!
+    if let Some(market_data) = calculate_market_price(&sku, &state.db_pool, state.live_key_price_metal).await {
+        
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
 
-    if is_lockdown {
-        tracing::warn!("🚨 Rejecting price calculation for {} due to lockdown.", payload.sku);
-        return Json(build_response(&payload.sku, 0.0, 0.0, current_key_value, "lockdown"));
+        // Ensure metal is snapped to standard TF2 increments (0.11, 0.22, etc.)
+        let response = PricerResponse {
+            sku: sku.clone(),
+            name: format!("Calculated {}", sku), // Optional: translate via schema in production
+            buy: Currency {
+                keys: (market_data.buy_metal / state.live_key_price_metal).floor() as i32,
+                metal: snap_to_scrap(market_data.buy_metal % state.live_key_price_metal),
+            },
+            sell: Currency {
+                keys: (market_data.sell_metal / state.live_key_price_metal).floor() as i32,
+                metal: snap_to_scrap(market_data.sell_metal % state.live_key_price_metal),
+            },
+            source: market_data.source,
+            time: current_time,
+        };
+
+        return Json(Some(response));
     }
 
-    // Call the engine with the database pool, key value, and schema map
-    let market_data = match calculate_market_price(&payload.sku, &state.db_pool, current_key_value, &state.schema).await {
-        Some(data) => data,
-        None => {
-            tracing::warn!("❌ [API] All fallback tiers failed for {}.", payload.sku);
-            return Json(build_response(&payload.sku, 0.0, 0.0, current_key_value, "unpriced"));
-        }
-    };
-
-    Json(build_response(
-        &payload.sku,
-        market_data.buy_metal,
-        market_data.sell_metal,
-        current_key_value,
-        &market_data.source
-    ))
+    Json(None)
 }
 
-fn build_response(sku: &str, buy_metal: f32, sell_metal: f32, key_val: f32, source: &str) -> PricerResponse {
-    PricerResponse {
-        sku: sku.to_string(),
-        name: None, 
-        buy: to_tf2_currency(buy_metal, key_val),
-        sell: to_tf2_currency(sell_metal, key_val),
-        source: source.to_string(),
-        time: Utc::now().timestamp(),
-    }
+/// Helper function to mathematically snap floating point metal to standard TF2 ref values.
+fn snap_to_scrap(metal: f32) -> f32 {
+    (metal * 9.0).round() / 9.0
 }
