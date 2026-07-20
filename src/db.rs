@@ -56,6 +56,5 @@ pub async fn get_adaptive_median(
 
 /// Boot handler used specifically to fetch raw key statistics on startup
 pub async fn get_24h_key_median(pool: &PgPool) -> Option<MarketSpread> {
-    // 🚨 FIX: Removed phantom volume argument and corrected order to (pool, sku, lookback)
     get_adaptive_median(pool, "5021;6", 1).await
 }

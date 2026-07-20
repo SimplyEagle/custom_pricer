@@ -3,6 +3,12 @@ use crate::db;
 use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
+struct AuthResponse {
+    #[serde(rename = "accessToken")]
+    access_token: String,
+}
+
+#[derive(Deserialize, Debug)]
 struct PriceDbItem {
     sell: Option<PriceDbCurrency>,
 }
@@ -51,15 +57,30 @@ pub async fn initialize_key_price(db_pool: &PgPool) -> f32 {
     60.00 // Returns a baseline, but the AppState is_lockdown flag should be flipped true in main
 }
 
-// --- The Real Tier 2 API Call (Open Endpoint) ---
+// --- The Real Tier 2 API Call (The TF2Autobot Handshake) ---
 async fn fetch_pricedb_key_price() -> Result<f32, Box<dyn std::error::Error>> {
-    // 🎯 We connect exactly like tf2autobot-pricedb does to bypass Cloudflare, 
-    // but we DO NOT attach an API key. This is a fully open API request!
     let client = reqwest::Client::builder()
-        .user_agent("TF2Autobot/5.16.8") // Whitelisted by Cloudflare
+        .user_agent("tf2autobot@5.16.8") // The exact bot user agent
         .build()?;
 
+    // STEP 1: The Anonymous Auth Handshake
+    // We request a temporary access token from the server (No API key needed!)
+    let auth_res = client.post("https://api.pricedb.io/v1/auth/access")
+        .send()
+        .await?;
+
+    if !auth_res.status().is_success() {
+        return Err(format!("Auth Handshake Failed. HTTP {}", auth_res.status()).into());
+    }
+
+    // Parse as text first to bypass the missing reqwest json feature
+    let auth_text = auth_res.text().await?;
+    let auth_data: AuthResponse = serde_json::from_str(&auth_text)?;
+
+    // STEP 2: The Price Query
+    // We attach the temporary Bearer token we just generated to authorize the GET request
     let response = client.get("https://api.pricedb.io/v1/items/5021;6")
+        .bearer_auth(auth_data.access_token)
         .send()
         .await?;
 
@@ -78,5 +99,5 @@ async fn fetch_pricedb_key_price() -> Result<f32, Box<dyn std::error::Error>> {
         }
     }
     
-    Err(format!("HTTP Error {}", response.status()).into())
+    Err(format!("Item Query Failed. HTTP {}", response.status()).into())
 }
